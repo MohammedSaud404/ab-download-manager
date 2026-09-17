@@ -1,0 +1,107 @@
+name: macOS launch probe
+
+on:
+  workflow_dispatch:
+
+jobs:
+  probe:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ "macos-latest", "macos-15", "macos-15-intel" ]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - name: Runner info
+        run: |
+          sw_vers
+          echo "arch: $(uname -m)"
+
+      - name: Check if setsid exists
+        run: |
+          echo "which setsid -> $(command -v setsid || echo '<<< NOT FOUND >>>')"
+          ls -l /usr/bin/setsid /bin/setsid /usr/local/bin/setsid /opt/homebrew/bin/setsid 2>&1 || true
+
+      - name: Reproduce the ProcessBuilder call used by execViaSetsid
+        run: |
+          cat > Repro.java <<'EOF'
+          import java.io.*;
+          public class Repro {
+              public static void main(String[] args) {
+                  try {
+                      Process p = new ProcessBuilder("setsid", "/bin/sleep", "3")
+                          .redirectOutput(ProcessBuilder.Redirect.DISCARD)
+                          .redirectError(ProcessBuilder.Redirect.DISCARD)
+                          .redirectInput(ProcessBuilder.Redirect.from(new File("/dev/null")))
+                          .start();
+                      System.out.println("RESULT: setsid started, pid=" + p.pid());
+                  } catch (IOException e) {
+                      System.out.println("RESULT: " + e.getClass().getName() + ": " + e.getMessage());
+                  }
+              }
+          }
+          EOF
+          java Repro.java
+
+      - name: Build a small test app bundle
+        run: |
+          B="$PWD/Probe.app"
+          mkdir -p "$B/Contents/MacOS"
+          cat > "$B/Contents/MacOS/Probe" <<'EOF'
+          #!/bin/bash
+          {
+            echo "argv       = $*"
+            echo "pid        = $$"
+            echo "ppid       = $PPID"
+            echo "session id = $(ps -o sess= -p $$ | tr -d ' ')"
+            echo "pgid       = $(ps -o pgid= -p $$ | tr -d ' ')"
+          } > /tmp/probe-out.txt
+          sleep 60
+          EOF
+          chmod +x "$B/Contents/MacOS/Probe"
+          cat > "$B/Contents/Info.plist" <<'EOF'
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0"><dict>
+            <key>CFBundleExecutable</key><string>Probe</string>
+            <key>CFBundleIdentifier</key><string>com.example.probe</string>
+            <key>CFBundleName</key><string>Probe</string>
+            <key>CFBundlePackageType</key><string>APPL</string>
+            <key>CFBundleVersion</key><string>1</string>
+            <key>LSBackgroundOnly</key><true/>
+          </dict></plist>
+          EOF
+          plutil -lint "$B/Contents/Info.plist"
+
+      - name: Launch with open and check args and detachment
+        run: |
+          rm -f /tmp/probe-out.txt
+          open -n "$PWD/Probe.app" --args --background
+          echo "open exit code = $?"
+          for i in $(seq 1 15); do [ -f /tmp/probe-out.txt ] && break; sleep 1; done
+          echo "what the app got:"
+          cat /tmp/probe-out.txt 2>&1 || echo "the app did not start"
+          echo "process table:"
+          ps -o pid,ppid,sess,pgid,command -ax | grep -i "[P]robe.app" || true
+
+      - name: Check the app survives after the caller exits
+        run: |
+          pkill -f "Probe.app" || true
+          sleep 1
+          rm -f /tmp/probe-out.txt
+          bash -c 'open -n "'"$PWD"'/Probe.app" --args --background; exit 0'
+          sleep 3
+          if pgrep -f "Probe.app" >/dev/null; then
+            echo "PASS: the app is still running after the caller exited"
+          else
+            echo "FAIL: the app died with the caller"
+          fi
+
+      - name: Check what happens without -n while an instance runs
+        run: |
+          rm -f /tmp/probe-out.txt
+          open -g "$PWD/Probe.app" --args --this-should-be-ignored
+          echo "open -g exit code = $?"
+          sleep 2
+          echo "if there is no new file then the args were dropped:"
+          cat /tmp/probe-out.txt 2>&1 || echo "no new file"
+          pkill -f "Probe.app" || true

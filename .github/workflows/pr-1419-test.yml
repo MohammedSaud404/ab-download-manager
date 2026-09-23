@@ -1,0 +1,115 @@
+name: PR 1419 build and test
+
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: branch to build
+        default: fix/macos-detached-launch
+
+jobs:
+  build-and-test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ macos-latest, macos-15, macos-15-intel ]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 75
+    steps:
+      - name: Checkout the branch
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref }}
+
+      - name: Set up JBR (same as upstream publish.yml)
+        uses: actions/setup-java@v4
+        with:
+          distribution: "jetbrains"
+          java-package: "jdk"
+          java-version: "25"
+          check-latest: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build packages (same as upstream publish.yml)
+        env:
+          SKIP_ANDROID_BUILD: "true"
+        run: |
+          sw_vers
+          git log --oneline -1
+          brew install create-dmg
+          ./gradlew
+          ./gradlew createReleaseFolderForCi
+          ./gradlew -stop
+          echo "--- build/ci-release:"
+          find build/ci-release -maxdepth 2 -type f | sort
+
+      - name: Write the test script
+        run: |
+          cat > "$RUNNER_TEMP/test.sh" <<'EOF'
+          #!/bin/bash
+          PKG="$1"
+          APP=/Applications/ABDownloadManager.app
+          CLI="$APP/Contents/MacOS/ABDownloadManagerCli"
+          echo "================ PACKAGE: $(basename "$PKG")"
+          sudo rm -rf "$APP"
+          case "$PKG" in
+            *.tar.gz) sudo tar -xzf "$PKG" -C /Applications ;;
+            *.dmg)
+              yes | hdiutil attach -nobrowse -noverify -noautoopen -mountpoint /Volumes/abdm "$PKG" >/dev/null
+              sudo cp -R /Volumes/abdm/ABDownloadManager.app /Applications/
+              hdiutil detach /Volumes/abdm >/dev/null ;;
+          esac
+          ls -l "$APP/Contents/MacOS/"
+          app_ps() { ps -axo pid=,ppid=,pgid=,args= | grep "[/]ABDownloadManager.app/Contents/MacOS/ABDownloadManager " || true; }
+          stop_app() { pkill -f "ABDownloadManager.app/Contents/MacOS/ABDownloadManager" || true; sleep 3; }
+
+          stop_app
+          echo "---- TEST 1: CLI gui start-if-not-started with the app not running"
+          echo "app before: $(app_ps)"
+          "$CLI" gui start-if-not-started >out.txt 2>err.txt; code=$?
+          echo "exit=$code"; echo "stdout: $(cat out.txt)"; echo "stderr:"; cat err.txt
+          echo "app after (pid ppid pgid args):"; app_ps
+          [ "$code" = 0 ] && grep -qx Started out.txt && echo "TEST 1 PASS" || echo "TEST 1 FAIL"
+
+          echo "---- TEST 2: CLI again while running"
+          "$CLI" gui start-if-not-started >out.txt 2>err.txt; code=$?
+          echo "exit=$code stdout: $(cat out.txt)"
+          [ "$code" = 0 ] && grep -qx AlreadyRunning out.txt && echo "TEST 2 PASS" || echo "TEST 2 FAIL"
+
+          stop_app
+          echo "---- TEST 3: CLI run from a fake browser session, then the browser group is killed"
+          python3 - "$CLI" <<'PY'
+          import os, signal, subprocess, sys, time
+          cli = sys.argv[1]
+          def app():
+              out = subprocess.run(["ps", "-axo", "pid=,ppid=,pgid=,args="], capture_output=True, text=True).stdout
+              return [l for l in out.splitlines() if "/ABDownloadManager.app/Contents/MacOS/ABDownloadManager " in l]
+          r, w = os.pipe()
+          browser = os.fork()
+          if browser == 0:
+              os.setsid()
+              p = subprocess.run([cli, "gui", "start-if-not-started"], capture_output=True, text=True)
+              os.write(w, f"{p.returncode}|{p.stdout.strip()}|{p.stderr.strip()}".encode())
+              time.sleep(120)
+              os._exit(0)
+          os.close(w)
+          res = os.read(r, 65536).decode()
+          print(f"[browser pgid={browser}] cli result: {res}")
+          print("app while browser alive:"); [print("   ", l) for l in app()]
+          os.killpg(browser, signal.SIGKILL); os.waitpid(browser, 0); time.sleep(5)
+          procs = app()
+          print("app after browser group killed:"); [print("   ", l) for l in procs]
+          ok = res.startswith("0|Started") and procs and all(str(browser) != l.split()[2] for l in procs)
+          print("TEST 3 PASS" if ok else "TEST 3 FAIL")
+          PY
+          "$CLI" gui start-if-not-started; echo "exit=$? (expect AlreadyRunning)"
+          stop_app
+          EOF
+          chmod +x "$RUNNER_TEMP/test.sh"
+
+      - name: Test tar.gz
+        run: '"$RUNNER_TEMP/test.sh" "$(find "$GITHUB_WORKSPACE/build/ci-release" -name "*mac*.tar.gz" | head -1)"'
+
+      - name: Test dmg
+        run: '"$RUNNER_TEMP/test.sh" "$(find "$GITHUB_WORKSPACE/build/ci-release" -name "*mac*.dmg" | head -1)"'

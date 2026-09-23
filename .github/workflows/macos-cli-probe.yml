@@ -1,0 +1,83 @@
+name: macOS CLI start-if-not-started probe
+
+on:
+  workflow_dispatch:
+
+jobs:
+  probe:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-latest
+            arch: arm64
+          - os: macos-15
+            arch: arm64
+          - os: macos-15-intel
+            arch: x64
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 15
+    env:
+      APP: /Applications/ABDownloadManager.app
+      CLI: /Applications/ABDownloadManager.app/Contents/MacOS/ABDownloadManagerCli
+    steps:
+      - name: Runner info
+        run: |
+          sw_vers
+          echo "arch: $(uname -m)"
+          echo "which setsid -> $(command -v setsid || echo '<<< NOT FOUND >>>')"
+
+      - name: Install official v1.10.4 release into /Applications
+        run: |
+          curl -sfL -o abdm.tar.gz "https://github.com/amir1376/ab-download-manager/releases/download/v1.10.4/ABDownloadManager_1.10.4_mac_${{ matrix.arch }}.tar.gz"
+          sudo tar -xzf abdm.tar.gz -C /Applications
+          ls -l "$APP/Contents/MacOS/"
+          echo "--- ABDownloadManagerCli.cfg [Application] section:"
+          sed -n '/\[Application\]/,/\[/p' "$APP/Contents/app/ABDownloadManagerCli.cfg"
+
+      - name: "1) CLI is valid: --help"
+        run: |
+          "$CLI" --help; echo "exit=$?"
+          "$CLI" gui --help; echo "exit=$?"
+
+      - name: "2) The exact command from EnsureAppIsAwake (app not running)"
+        run: |
+          pgrep -fl "ABDownloadManager.app" || echo "app is not running (expected)"
+          set +e
+          "$CLI" gui start-if-not-started >stdout.txt 2>stderr.txt
+          code=$?
+          set -e
+          echo "exit=$code"
+          echo "===== STDOUT ====="; cat stdout.txt
+          echo "===== STDERR ====="; cat stderr.txt
+          echo "=================="
+          pgrep -fl "ABDownloadManager.app" || echo "app is still NOT running"
+
+      - name: "3) Control: same command with a setsid shim on PATH"
+        run: |
+          mkdir -p shim
+          cat > shim/setsid <<'EOF'
+          #!/usr/bin/perl
+          use POSIX ();
+          POSIX::setsid();
+          exec { $ARGV[0] } @ARGV or die "exec failed: $!";
+          EOF
+          chmod +x shim/setsid
+          export PATH="$PWD/shim:$PATH"
+          echo "which setsid -> $(command -v setsid)"
+          set +e
+          "$CLI" gui start-if-not-started >stdout.txt 2>stderr.txt
+          code=$?
+          set -e
+          echo "exit=$code"
+          echo "===== STDOUT ====="; cat stdout.txt
+          echo "===== STDERR ====="; cat stderr.txt
+          echo "=================="
+          pgrep -fl "ABDownloadManager.app" || echo "app is NOT running"
+
+      - name: "4) Run it again now that the app is running"
+        run: |
+          set +e
+          "$CLI" gui start-if-not-started; echo "exit=$?"
+          set -e
+          pkill -f "ABDownloadManager.app" || true

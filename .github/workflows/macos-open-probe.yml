@@ -1,0 +1,165 @@
+name: macOS open launch probe
+
+on:
+  workflow_dispatch:
+
+jobs:
+  find-setsid:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ macos-latest, macos-15, macos-15-intel ]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
+    steps:
+      - name: Runner info
+        run: |
+          sw_vers
+          echo "arch: $(uname -m)"
+
+      - name: Search the whole disk for a setsid binary
+        run: |
+          echo "PATH=$PATH"
+          echo "command -v setsid -> $(command -v setsid || echo '<<< NOT FOUND >>>')"
+          echo "--- find / -name 'setsid*' (all volumes, files and links):"
+          sudo find / \( -type f -o -type l \) -name 'setsid*' 2>/dev/null | grep -v '^/System/Volumes/Data/private/var/folders' || echo "<<< NO FILE NAMED setsid* ANYWHERE >>>"
+          echo "--- man pages that mention setsid:"
+          man -k setsid 2>/dev/null || true
+          man -w 1 setsid 2>&1 || true
+          man -w 2 setsid 2>&1 || true
+
+  launch:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ macos-latest, macos-15, macos-15-intel ]
+        pkg: [ tar.gz, dmg ]
+        include:
+          - os: macos-latest
+            arch: arm64
+          - os: macos-15
+            arch: arm64
+          - os: macos-15-intel
+            arch: x64
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
+    env:
+      APP: /Applications/ABDownloadManager.app
+      CLI: /Applications/ABDownloadManager.app/Contents/MacOS/ABDownloadManagerCli
+      FILE: ABDownloadManager_1.10.4_mac_${{ matrix.arch }}.${{ matrix.pkg }}
+    steps:
+      - name: Runner info
+        run: |
+          sw_vers
+          echo "arch: $(uname -m)  package: $FILE"
+
+      - name: Download official v1.10.4
+        run: curl -sfL -o "$FILE" "https://github.com/amir1376/ab-download-manager/releases/download/v1.10.4/$FILE"
+
+      - name: Install from tar.gz
+        if: matrix.pkg == 'tar.gz'
+        run: sudo tar -xzf "$FILE" -C /Applications
+
+      - name: Install from dmg
+        if: matrix.pkg == 'dmg'
+        run: |
+          yes | hdiutil attach -nobrowse -noverify -noautoopen -mountpoint /Volumes/abdm "$FILE" >/dev/null
+          ls -la /Volumes/abdm
+          sudo cp -R /Volumes/abdm/ABDownloadManager.app /Applications/
+          hdiutil detach /Volumes/abdm
+
+      - name: Which executable does open start
+        run: |
+          echo "--- launchers in the bundle:"
+          ls -l "$APP/Contents/MacOS/"
+          echo "--- CFBundleExecutable (what open launches):"
+          /usr/libexec/PlistBuddy -c 'Print :CFBundleExecutable' "$APP/Contents/Info.plist"
+          echo "--- signature:"
+          codesign -dv "$APP" 2>&1 | grep -E 'Identifier|Authority|TeamIdentifier|Signature' || true
+          spctl -a -vv "$APP" 2>&1 || true
+
+      - name: Launch from a fake browser session and kill that session
+        run: |
+          pgrep -fl "ABDownloadManager.app" && { echo "app already running, unexpected"; exit 1; } || echo "app is not running (expected)"
+          python3 - <<'EOF'
+          import os, signal, subprocess, time
+
+          APP = os.environ["APP"]
+
+          def app_procs():
+              out = subprocess.run(["ps", "-axo", "pid=,ppid=,pgid=,sess=,args="], capture_output=True, text=True).stdout
+              return [l for l in out.splitlines() if "/ABDownloadManager.app/Contents/MacOS/" in l]
+
+          # Fake browser: its own session and process group, like a browser running a native messaging host.
+          browser = os.fork()
+          if browser == 0:
+              os.setsid()
+              r = subprocess.run(["open", "-n", APP, "--args", "--background"])
+              print(f"[browser] pid={os.getpid()} pgid={os.getpgrp()} open exit code = {r.returncode}", flush=True)
+              time.sleep(120)
+              os._exit(0)
+
+          for _ in range(30):
+              time.sleep(1)
+              if app_procs():
+                  break
+          time.sleep(3)
+          print("--- app process after open (pid ppid pgid sess args):")
+          for l in app_procs():
+              print("   ", l)
+
+          print(f"--- killing the whole fake browser process group {browser} with SIGKILL")
+          os.killpg(browser, signal.SIGKILL)
+          os.waitpid(browser, 0)
+          time.sleep(5)
+          procs = app_procs()
+          print("--- app process after the browser group was killed:")
+          for l in procs:
+              print("   ", l)
+          print("PASS: app survived the browser being killed" if procs else "FAIL: app died with the browser")
+          EOF
+
+      - name: The app is ready and recognized by the single instance check
+        run: |
+          set +e
+          "$CLI" gui start-if-not-started; echo "exit=$?"
+          set -e
+          pkill -f "ABDownloadManager.app" || true
+          sleep 2
+
+      - name: "Control: launch as a plain child and kill the browser group"
+        run: |
+          python3 - <<'EOF'
+          import os, signal, subprocess, time
+
+          EXE = os.environ["APP"] + "/Contents/MacOS/ABDownloadManager"
+
+          def app_procs():
+              out = subprocess.run(["ps", "-axo", "pid=,ppid=,pgid=,sess=,args="], capture_output=True, text=True).stdout
+              return [l for l in out.splitlines() if "/ABDownloadManager.app/Contents/MacOS/" in l]
+
+          browser = os.fork()
+          if browser == 0:
+              os.setsid()
+              subprocess.Popen([EXE, "--background"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+              time.sleep(120)
+              os._exit(0)
+
+          for _ in range(30):
+              time.sleep(1)
+              if app_procs():
+                  break
+          time.sleep(3)
+          print("--- app process as a plain child:")
+          for l in app_procs():
+              print("   ", l)
+          os.killpg(browser, signal.SIGKILL)
+          os.waitpid(browser, 0)
+          time.sleep(5)
+          procs = app_procs()
+          print("--- after killing the browser group:")
+          for l in procs:
+              print("   ", l)
+          print("control: app survived (not expected)" if procs else "control: app died with the browser (expected, this is why detaching matters)")
+          EOF
+          pkill -f "ABDownloadManager.app" || true

@@ -52,7 +52,7 @@ jobs:
       CLI: /Applications/ABDownloadManager.app/Contents/MacOS/ABDownloadManagerCli
       FILE: ABDownloadManager_1.10.4_mac_${{ matrix.arch }}.${{ matrix.pkg }}
       # the wrapper that would replace `setsid <exe> <args>` on macOS
-      PERL_SETSID: 'defined(POSIX::setsid()) or die "setsid failed: $!\n"; exec { $ARGV[0] } @ARGV or die "exec failed: $!\n"'
+      PERL_SETSID: 'my $s = POSIX::setsid(); die "setsid failed: $!\n" unless defined($s) && $s > 0; exec { $ARGV[0] } @ARGV or die "exec failed: $!\n"'
     steps:
       - name: Runner info
         run: |
@@ -200,3 +200,13 @@ jobs:
           set +e
           python3 -c 'import os,sys; os.setpgid(0,0); os.execv("/usr/bin/perl", ["perl","-MPOSIX","-e",os.environ["PERL_SETSID"],"--","/bin/echo","should not print"])'
           echo "exit=$?"
+          exit 0
+
+      - name: "Edge: what POSIX::setsid returns (leader vs not leader)"
+        env:
+          DIAG: 'my $s = POSIX::setsid(); printf "pid=%d setsid returned %s errno=%s\n", $$, (defined $s ? "[$s]" : "undef"), ($! + 0) . " $!"'
+        run: |
+          echo "--- not a group leader (child of this shell):"
+          /usr/bin/perl -MPOSIX -e "$DIAG"
+          echo "--- already a group leader:"
+          python3 -c 'import os; os.setpgid(0,0); os.execv("/usr/bin/perl", ["perl","-MPOSIX","-e",os.environ["DIAG"]])'

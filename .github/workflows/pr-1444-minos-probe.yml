@@ -36,5 +36,5 @@ jobs:
           for v in 10.13 11.0; do
             echo "--- with -mmacosx-version-min=$v:"
             clang $S $FLAGS -mmacosx-version-min=$v -o pr-$v 2>&1; echo "  clang exit=$?"
-            [ -f pr-$v ] && show pr-$v && ./pr-$v /bin/echo "  minos $v build ran" && codesign -dv pr-$v 2>&1 | grep -E 'flags'
+            [ -f pr-$v ] && show pr-$v && ./pr-$v /bin/echo "  minos $v build ran" && codesign -dv pr-$v 2>&1 | grep -E 'flags' || echo "  (no linker signature on this host's slice)"
           done

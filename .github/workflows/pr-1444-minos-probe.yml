@@ -1,0 +1,40 @@
+name: PR 1444 minos probe
+
+on:
+  workflow_dispatch:
+
+jobs:
+  minos:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ macos-latest, macos-15, macos-15-intel ]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: test/pr-1444
+
+      - name: Compile with the PR flags, with and without a deployment target
+        run: |
+          set +e
+          sw_vers -productVersion
+          clang --version | head -1
+          S=desktop/mac_utils/src/main/native/setsid.c
+          FLAGS="-O2 -Wall -Wextra -Werror -arch arm64 -arch x86_64"
+          show() {
+            for a in arm64 x86_64; do
+              m=$(otool -arch $a -l "$1" | grep -A5 LC_BUILD_VERSION | awk '/minos/{print $2}')
+              cf=$(otool -arch $a -l "$1" | grep -c LC_DYLD_CHAINED_FIXUPS)
+              di=$(otool -arch $a -l "$1" | grep -c LC_DYLD_INFO_ONLY)
+              echo "  [$a] minos=$m chained_fixups=$cf dyld_info=$di"
+            done
+          }
+          echo "--- as in the PR (no deployment target):"
+          clang $S $FLAGS -o pr-default 2>&1; echo "  clang exit=$?"; show pr-default
+          for v in 10.13 11.0; do
+            echo "--- with -mmacosx-version-min=$v:"
+            clang $S $FLAGS -mmacosx-version-min=$v -o pr-$v 2>&1; echo "  clang exit=$?"
+            [ -f pr-$v ] && show pr-$v && ./pr-$v /bin/echo "  minos $v build ran" && codesign -dv pr-$v 2>&1 | grep -E 'flags'
+          done
